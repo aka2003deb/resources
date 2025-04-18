@@ -1,0 +1,303 @@
+#pragma once
+#include <systemc.h>
+
+class counter : public sc_module {
+public:
+    // Internal Registers
+     sc_uint<8> CTRL;                     // Timer Control Register
+     sc_uint<8> VALUE;                    // Timer Value Register (Read-only)
+     sc_uint<8> COMPARE;                  // Timer Compare Register
+     sc_uint<8> STATUS;                   // Timer Interrupt Status Register
+
+    // Ports
+    sc_in<bool> clock;                   // Clock signal
+    sc_in<bool> reset;                   // Reset signal (active high)
+    sc_in<sc_uint<8>> address;           // Address (8-bit)
+    sc_in<sc_uint<8>> data;              // Data (8-bit)
+    sc_in<bool> read_enable;             // Read Enable signal
+    sc_in<bool> write_enable;            // Write Enable signal
+
+    sc_out<bool> interrupt0;             // Compare match interrupt (Active High)
+    sc_out<bool> interrupt1;             // Overflow interrupt (Active High)
+
+    // Constructor
+    SC_HAS_PROCESS(counter);
+    counter(sc_module_name name);
+    
+    // Internal Variables
+    bool interrupt0_flag;              // Internal flag for interrupt0
+    bool interrupt1_flag;              // Internal flag for interrupt1
+
+    // Processes
+    void counter_logic();                  // Timer logic
+    void reset_func();                   //For handling reset operation
+    void register_access();              //For modifyting the register values
+
+};
+
+#include "counter.h"
+
+counter::counter(sc_module_name name) : sc_module(name) {
+    //initilaize the values before the simulation
+    CTRL = 0;
+    VALUE = 0;
+    STATUS = 0;
+    COMPARE = 0;
+    interrupt0.write(false);
+    interrupt1.write(false);
+
+    // Register processes
+    SC_METHOD(counter_logic);
+    sensitive << clock.pos();  // Trigger on positive edge of the clock
+
+    SC_METHOD(register_access);
+    sensitive << clock.pos();
+
+    SC_METHOD(reset_func);
+    sensitive << reset;
+}
+void counter::reset_func() {
+    if (reset.read()) {
+        // Reset all values to default
+        CTRL = 0;
+        VALUE = 0;
+        STATUS = 0;
+        //COMPARE register value is not changed on reset
+        interrupt0.write(false);
+        interrupt1.write(false);
+    }
+}
+void counter::counter_logic() {
+        if (CTRL[0]) { // Check Timer Enable (bit 0 of CTRL)
+            VALUE++; // Increment timer counter
+
+            // Check for Compare Match Interrupt
+            if (CTRL[1] && VALUE == COMPARE) { // CMP bit (bit 1 of CTRL)
+                STATUS[0] = 1; // Set Compare Match Interrupt status bit
+                interrupt0_flag = true;
+            }
+
+            // Check for Overflow Interrupt
+            if (CTRL[2] && VALUE == 0xFF) { // OV bit (bit 2 of CTRL)
+                STATUS[1] = 1; // Set Overflow Interrupt status bit
+                interrupt1_flag = true;
+            }
+
+            // Update the active interrupts
+            interrupt0.write(interrupt0_flag);
+            interrupt1.write(interrupt1_flag);
+        }
+}
+
+// This is the internal register access mechanism
+void counter::register_access() {
+    if (write_enable.read()) {
+        switch (address.read()) {
+        case 0x0: // Timer Control Register
+            CTRL = data.read();
+            break;
+        case 0x8: // Timer Compare Register
+            COMPARE = data.read();
+            break;
+        case 0xC: // Timer Interrupt Status Register
+            // Write-one-to-clear logic
+            if (data.read()[0]) {
+                STATUS[0] = 0;
+                interrupt0_flag= false;
+            }
+            if (data.read()[1]) {
+                STATUS[1] = 0;
+                interrupt1_flag = false;
+            }
+            break;
+        }
+    }
+}
+#pragma once
+#include <systemc.h>
+
+#define COMPARE_VALUE 32     //set the compare value here
+
+class tb_counter : public sc_module {
+public:
+    // Ports
+    sc_out<bool> tb_clock;                  // Clock signal
+    sc_out<bool> tb_reset;                  // Reset signal
+    sc_out<sc_uint<8>> tb_address;          // Address
+    sc_out<sc_uint<8>> tb_data;             // Data
+    sc_out<bool> tb_read_enable;            // Read enable
+    sc_out<bool> tb_write_enable;           // Write enable
+
+    sc_in<bool> tb_interrupt0;              // Compare match interrupt
+    sc_in<bool> tb_interrupt1;              // Overflow interrupt
+
+    // Constructor
+    SC_HAS_PROCESS(tb_counter);
+    tb_counter(sc_module_name name);
+
+    // Test process
+    void test();
+    void clock_cycle();
+
+    //Ordinary member functions
+    void register_write(sc_uint<8> address_var, sc_uint<8> data_var);
+    sc_uint<8> register_read(sc_uint<8> address_var);
+};
+#include "tb_counter.h"
+
+tb_counter::tb_counter(sc_module_name name): sc_module(name) {
+    SC_THREAD(test);        // Main test process
+    SC_THREAD(clock_cycle); // Clock generation process
+}
+
+void tb_counter::clock_cycle() {
+    while (true) {
+        tb_clock.write(true);
+        wait(5, SC_NS);  // Half clock period
+        tb_clock.write(false);
+        wait(5, SC_NS);  // Half clock period
+    }
+}
+
+void tb_counter::register_write(sc_uint<8> address_var, sc_uint<8> data_var) {
+    tb_address.write(address_var);
+    tb_data.write(data_var);
+    tb_write_enable.write(true);
+    wait(10, SC_NS); // Wait for the write operation to complete
+    tb_write_enable.write(false);
+}
+
+sc_uint<8> tb_counter::register_read(sc_uint<8> address_var) {
+    tb_address.write(address_var);
+    tb_read_enable.write(true);
+    wait(10, SC_NS); // Wait for the read operation to complete
+    tb_read_enable.write(false);
+    return tb_data.read();
+}
+
+void tb_counter::test() {
+    cout << "Starting Timer Testbench..." << endl;
+
+    // Step 1: Reset the system
+    tb_reset.write(true);
+    wait(10, SC_NS);
+    tb_reset.write(false);
+
+    // Step 2: Configure Timer Control Register (Enable Timer, Enable Interrupts)
+    cout << "Configuring Timer Control Register..." << endl;
+    register_write(0x0, 0x7); // Enable Timer, Enable CMP, Enable OV
+
+    // Step 3: Set Compare Register
+    cout << "Setting Compare Register to " << COMPARE_VALUE << endl;
+    register_write(0x8, COMPARE_VALUE); // Set compare value
+
+    // Step 4: Observe interrupts during timer operation
+    cout << "Observing Timer Operation for Compare and Overflow Interrupts..." << endl;
+
+    for (int i = 0; i < 300; i++) {  // Simulate 300 clock cycles
+        wait(10, SC_NS); // Wait for one clock cycle
+
+        if (tb_interrupt0.read()) {
+            cout << "Compare Match Interrupt Triggered at Time: " << sc_time_stamp() << endl;
+            // Clear Compare Match Interrupt
+            register_write(0xC, 0x1); // Clear Compare Match Interrupt (STATUS[0])
+        }
+
+        if (tb_interrupt1.read()) {
+            cout << "Overflow Interrupt Triggered at Time: " << sc_time_stamp() << endl;
+            // Clear Overflow Interrupt
+            register_write(0xC, 0x2); // Clear Overflow Interrupt (STATUS[1])
+        }
+    }
+
+    // Step 5: Verify register values
+    cout << "Reading Timer Value Register..." << endl;
+    sc_uint<8> timer_value = register_read(0x4);
+    cout << "Timer Value: " << timer_value << endl;
+    cout << "Test Completed. Ending Simulation..." << endl;
+    sc_stop(); // End simulation
+}
+#pragma once
+#include "counter.h"
+#include "tb_counter.h"
+
+class top : public sc_module {
+public:
+    // Internal Signals
+    sc_signal<bool> clock_signal;
+    sc_signal<bool> reset_signal;
+    sc_signal<sc_uint<8>> address_signal;
+    sc_signal<sc_uint<8>> data_signal;
+    sc_signal<bool> read_enable_signal;
+    sc_signal<bool> write_enable_signal;
+    sc_signal<bool,SC_MANY_WRITERS> interrupt0_signal;
+    sc_signal<bool,SC_MANY_WRITERS> interrupt1_signal;
+
+    // Sub-modules (statically allocated)
+    tb_counter tb;    // Testbench instance
+    counter timer;    // Timer counter module instance
+
+    // Constructor
+    SC_HAS_PROCESS(top);
+    top(sc_module_name name);
+};#include "top.h"
+
+top::top(sc_module_name name): sc_module(name),timer("timer"),tb("tb_counter"){
+    // Bind signals to Timer Counter Module
+    timer.clock(clock_signal);
+    timer.reset(reset_signal);
+    timer.address(address_signal);
+    timer.data(data_signal);
+    timer.read_enable(read_enable_signal);
+    timer.write_enable(write_enable_signal);
+    timer.interrupt0(interrupt0_signal);
+    timer.interrupt1(interrupt1_signal);
+
+    // Bind signals to Testbench
+    tb.tb_clock(clock_signal);
+    tb.tb_reset(reset_signal);
+    tb.tb_address(address_signal);
+    tb.tb_data(data_signal);
+    tb.tb_read_enable(read_enable_signal);
+    tb.tb_write_enable(write_enable_signal);
+    tb.tb_interrupt0(interrupt0_signal);
+    tb.tb_interrupt1(interrupt1_signal);
+
+    // For waveform tracing
+    /*sc_trace_file* tf = sc_create_vcd_trace_file("traces");
+    sc_trace(tf, clock_signal, "clock");
+    sc_trace(tf, reset_signal, "reset");
+    sc_trace(tf, address_signal, "address");
+    sc_trace(tf, data_signal, "data");
+    sc_trace(tf, read_enable_signal, "read_enable");
+    sc_trace(tf, write_enable_signal, "write_enable");
+    sc_trace(tf, interrupt0_signal, "interrupt0");
+    sc_trace(tf, interrupt1_signal, "interrupt1");
+    sc_trace(tf, timer.CTRL, "CTRL");
+    sc_trace(tf, timer.VALUE, "VALUE");
+    sc_trace(tf, timer.COMPARE, "COMPARE");
+    sc_trace(tf, timer.STATUS, "STATUS");*/
+}#include <systemc.h>
+#include "top.h"
+
+int sc_main(int argc, char* argv[]) {
+    
+    top top_module("top");  // Create the top-level module (statically allocated)
+
+    sc_start();             // Start the SystemC simulation
+
+    return 0;
+}
+
+this is the entire code for this i provided to u at once but the output i am geetign as folloows:
+        SystemC 2.3.4-Accellera --- Aug 16 2023 12:23:24
+        Copyright (c) 1996-2022 by all Contributors,
+        ALL RIGHTS RESERVED
+
+Error: (E112) get interface failed: port is not bound: port 'top.timer.port_6' (sc_out)
+In file: C:\Users\Sunkadakatte\Desktop\Systemc\systemc-2.3.4\src\sysc\communication\sc_port.cpp:235
+
+C:\Examples\counter_CA\Debug\counter_CA.exe (process 20664) exited with code 1.
+To automatically close the console when debugging stops, enable Tools->Options->Debugging->Automatically close the console when debugging stops.
+Press any key to close this window . . .
+make chnages whverever necsaary make it error free abd logically correct and fix this issue and also which port is nort bound show me?
