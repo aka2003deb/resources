@@ -1,3 +1,4 @@
+
 #pragma once
 #include <systemc.h>
 
@@ -24,17 +25,12 @@ public:
     SC_HAS_PROCESS(counter);
     counter(sc_module_name name);
     
-    // Internal Variables
-    bool interrupt0_flag;              // Internal flag for interrupt0
-    bool interrupt1_flag;              // Internal flag for interrupt1
-
     // Processes
     void counter_logic();                  // Timer logic
     void reset_func();                   //For handling reset operation
-    void register_access();              //For modifyting the register values
+    void register_access();              //For modifying the register values
 
 };
-
 #include "counter.h"
 
 counter::counter(sc_module_name name) : sc_module(name) {
@@ -43,15 +39,13 @@ counter::counter(sc_module_name name) : sc_module(name) {
     VALUE = 0;
     STATUS = 0;
     COMPARE = 0;
-    interrupt0.write(false);
-    interrupt1.write(false);
-
+ 
     // Register processes
     SC_METHOD(counter_logic);
     sensitive << clock.pos();  // Trigger on positive edge of the clock
 
     SC_METHOD(register_access);
-    sensitive << clock.pos();
+    sensitive << write_enable << read_enable;
 
     SC_METHOD(reset_func);
     sensitive << reset;
@@ -70,22 +64,18 @@ void counter::reset_func() {
 void counter::counter_logic() {
         if (CTRL[0]) { // Check Timer Enable (bit 0 of CTRL)
             VALUE++; // Increment timer counter
-
+      
             // Check for Compare Match Interrupt
-            if (CTRL[1] && VALUE == COMPARE) { // CMP bit (bit 1 of CTRL)
+            if (CTRL[1] && VALUE == 32) { // CMP bit (bit 1 of CTRL)
                 STATUS[0] = 1; // Set Compare Match Interrupt status bit
-                interrupt0_flag = true;
+                interrupt0.write(true);
             }
 
             // Check for Overflow Interrupt
             if (CTRL[2] && VALUE == 0xFF) { // OV bit (bit 2 of CTRL)
                 STATUS[1] = 1; // Set Overflow Interrupt status bit
-                interrupt1_flag = true;
-            }
-
-            // Update the active interrupts
-            interrupt0.write(interrupt0_flag);
-            interrupt1.write(interrupt1_flag);
+                interrupt1.write(true);
+            }  
         }
 }
 
@@ -93,22 +83,30 @@ void counter::counter_logic() {
 void counter::register_access() {
     if (write_enable.read()) {
         switch (address.read()) {
-        case 0x0: // Timer Control Register
-            CTRL = data.read();
-            break;
-        case 0x8: // Timer Compare Register
-            COMPARE = data.read();
-            break;
-        case 0xC: // Timer Interrupt Status Register
+        case 0x0: CTRL = data.read();  break;
+        case 0x8: COMPARE = data.read(); break;
+        case 0xC: 
             // Write-one-to-clear logic
             if (data.read()[0]) {
                 STATUS[0] = 0;
-                interrupt0_flag= false;
+                interrupt0.write(false);
             }
             if (data.read()[1]) {
                 STATUS[1] = 0;
-                interrupt1_flag = false;
+                interrupt1.write(false);
             }
+            break;
+        }
+    }
+    if (read_enable.read()) {
+        switch (address.read()) {
+        case 0x0:cout << "The current value of CTRl register is= " << CTRL << endl;
+            break;
+        case 0x4:cout << "The current value of VALUE register is= " << VALUE << endl;
+            break;
+        case 0x8:cout << "The current value of COMPARE register is= " << COMPARE << endl;
+            break;
+        case 0xC:cout << "The current value of STATUS register is= " << STATUS << endl;
             break;
         }
     }
@@ -141,7 +139,7 @@ public:
 
     //Ordinary member functions
     void register_write(sc_uint<8> address_var, sc_uint<8> data_var);
-    sc_uint<8> register_read(sc_uint<8> address_var);
+    void register_read(sc_uint<8> address_var);
 };
 #include "tb_counter.h"
 
@@ -152,9 +150,9 @@ tb_counter::tb_counter(sc_module_name name): sc_module(name) {
 
 void tb_counter::clock_cycle() {
     while (true) {
-        tb_clock.write(true);
-        wait(5, SC_NS);  // Half clock period
         tb_clock.write(false);
+        wait(5, SC_NS);  // Half clock period
+        tb_clock.write(true);
         wait(5, SC_NS);  // Half clock period
     }
 }
@@ -163,16 +161,15 @@ void tb_counter::register_write(sc_uint<8> address_var, sc_uint<8> data_var) {
     tb_address.write(address_var);
     tb_data.write(data_var);
     tb_write_enable.write(true);
-    wait(10, SC_NS); // Wait for the write operation to complete
+    wait(SC_ZERO_TIME); // Wait for the write operation to complete
     tb_write_enable.write(false);
 }
 
-sc_uint<8> tb_counter::register_read(sc_uint<8> address_var) {
+void tb_counter::register_read(sc_uint<8> address_var) {
     tb_address.write(address_var);
     tb_read_enable.write(true);
-    wait(10, SC_NS); // Wait for the read operation to complete
+    wait(SC_ZERO_TIME); // Wait for the read operation to complete
     tb_read_enable.write(false);
-    return tb_data.read();
 }
 
 void tb_counter::test() {
@@ -180,7 +177,7 @@ void tb_counter::test() {
 
     // Step 1: Reset the system
     tb_reset.write(true);
-    wait(10, SC_NS);
+    wait(SC_ZERO_TIME);
     tb_reset.write(false);
 
     // Step 2: Configure Timer Control Register (Enable Timer, Enable Interrupts)
@@ -211,9 +208,8 @@ void tb_counter::test() {
     }
 
     // Step 5: Verify register values
-    cout << "Reading Timer Value Register..." << endl;
-    sc_uint<8> timer_value = register_read(0x4);
-    cout << "Timer Value: " << timer_value << endl;
+    cout << "At the end of the simulation...Reading Timer Value Register..." << endl;
+    register_read(0x4);
     cout << "Test Completed. Ending Simulation..." << endl;
     sc_stop(); // End simulation
 }
@@ -277,7 +273,8 @@ top::top(sc_module_name name): sc_module(name),timer("timer"),tb("tb_counter"){
     sc_trace(tf, timer.VALUE, "VALUE");
     sc_trace(tf, timer.COMPARE, "COMPARE");
     sc_trace(tf, timer.STATUS, "STATUS");*/
-}#include <systemc.h>
+}
+#include <systemc.h>
 #include "top.h"
 
 int sc_main(int argc, char* argv[]) {
@@ -288,16 +285,70 @@ int sc_main(int argc, char* argv[]) {
 
     return 0;
 }
+here are all the files for the prvious experiment which was the counter design using cycle accurate modelling now i want the counter desgin using the event based approach and the question of that is as follows:2.10	8-bit Timer Counter Module – Event Based
+Objective	Implement Event based 8 bit Timer Counter Module using SystemC   
+Requirements	Input Ports
+	sc_time inputClock (This will be configured with clock time period at which it should increment its counter and this time period value is provided by TB)
+	Boolean reset
+	Uint address<8>
+	Uint data<8>
+	Boolean read_enable
+	Boolean write_enable
+Output Ports
+	Boolean interrupt0 (Active High Pulse Interrupt)
+	Boolean interrupt1 (Active High Pulse Interrupt)
 
-this is the entire code for this i provided to u at once but the output i am geetign as folloows:
-        SystemC 2.3.4-Accellera --- Aug 16 2023 12:23:24
-        Copyright (c) 1996-2022 by all Contributors,
-        ALL RIGHTS RESERVED
+Registers
+The module should also consists of couple of 8bit Special Function Registers(SFRs) to configure the Timer module. The register sets as defined as below:
+ 
+2.	Timer control Register(CTRL) - Offset Address = 0x0
+ 
+ 
+0bit - En - Timer Enable bit, where if you configure it to:
+0 => Timer is disable and counter does not increment All register can still be read and written 
+1 => Timer is enabled and counter will increment normally. Timer counter will be incremented every clock cycle.
+ 
+1bit - CMP- Timer compare Interrupt Enable, where if you configure it to:
+0 =>Compare interrupt is disabled  
+1 => Compare interrupt is enable. 
+If enabled then whenever timer counter value reaches to compare value it will raise the interrupt line(Interrupt0).
+ 
+2bit - OV - Overflow Interrupt Enable, where if you configure it to:
+0 =>Overflow interrupt is disabled  
+1 => Overflow interrupt is enable. 
+if timer counter value reaches to OxFF, in the next clock cycle it will update start counting from zero, and raise the interrupt line(Interrupt1) corresponding to overflow interrupt.
+ 
+3.	Timer Value Register - Offset Address = 0x4
+ 
+ 
+This is a read only register, Whenever timer is enabled it will start incrementing value of this register. 
+ 
+4.	Timer Compare Register - Offset Address = 0x8
+ 
+ 
+This register can be used to store the comparison value for timer counter register. If timer compare interrupt is enable, then it will assert an interrupt line INTO whenever timer value matches with the timer compare value.
+ 
+5.	Timer Interrupt status Register - Offset Address = 0xC
+ 
+ 
+This is a write one clear interrupt status register. If timer is enabled then whenever timer counter value reaches a comparator value or an overflow occurs then it will update the corresponding status bit if related interrupt is enabled. Writing a 1 will clear the corresponding interrupt
 
-Error: (E112) get interface failed: port is not bound: port 'top.timer.port_6' (sc_out)
-In file: C:\Users\Sunkadakatte\Desktop\Systemc\systemc-2.3.4\src\sysc\communication\sc_port.cpp:235
+Test Scenario	Implement the 8-bit Timer Counter Module with event-based approach:
+1.	The timer model should not have the pin for the clock.
+2.	The timer should not count/increment at every clock edge, rather we should apply the mathematical formulas to calculate when the interrupts will be generated. that means increment should not be sensitive to the clock.
+3.	The testbench should remain the same, only the clock pin will be removed.
+4.	You should get exactly the same output, which means functionality will be the same.
+5.	Note down how much wall clock time is consumed by the simulation.
+6.	Run both implementations of models, and check the difference in the wall clock time elapsed for simulating the same amount of simulation time. And conclude your decision.
 
-C:\Examples\counter_CA\Debug\counter_CA.exe (process 20664) exited with code 1.
-To automatically close the console when debugging stops, enable Tools->Options->Debugging->Automatically close the console when debugging stops.
-Press any key to close this window . . .
-make chnages whverever necsaary make it error free abd logically correct and fix this issue and also which port is nort bound show me?
+Note: Timer module has to clear the interrupts (interrupt0 and interrupt1) (once it is set to due to trigger condition) after one cycle of the input time interval
+ 
+ 
+Negative Test Scenario:
+1.	The Interrupt0/1 has to be logic low in entire simulation time except when overflow or comparator match event is triggered
+Pass Criteria	1.	Modelling the timer module by using sc_time and not the bool clock
+2.	Registers set should be accessible from TB
+3.	Interrupt0 and Interrupt1 has to be triggered at expected time and also needs to update corresponding status register bit fields
+Key Learnings	1.	Event Based Modelling
+2.	Raising/Toggling the Interrupts using input sc_time clock period as reference (Without Boolean clock)
+now take the refrences of the code provided to u(in case fo cycle acurrate modelling) and preovide the code for the event based modelling based on the modifaction of that code accordign the question and the requitments given to u 
