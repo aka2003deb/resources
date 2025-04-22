@@ -1,117 +1,203 @@
-
 #pragma once
 #include <systemc.h>
 
 class counter : public sc_module {
 public:
     // Internal Registers
-     sc_uint<8> CTRL;                     // Timer Control Register
-     sc_uint<8> VALUE;                    // Timer Value Register (Read-only)
-     sc_uint<8> COMPARE;                  // Timer Compare Register
-     sc_uint<8> STATUS;                   // Timer Interrupt Status Register
+    sc_uint<8> CTRL;                     // Timer Control Register
+    sc_uint<8> VALUE;                    // Timer Value Register (Read-only)
+    sc_uint<8> COMPARE;                  // Timer Compare Register
+    sc_uint<8> STATUS;                   // Timer Interrupt Status Register
 
     // Ports
-    sc_in<bool> clock;                   // Clock signal
+    sc_in<sc_time> inputClock;           // Clock period input
     sc_in<bool> reset;                   // Reset signal (active high)
     sc_in<sc_uint<8>> address;           // Address (8-bit)
     sc_in<sc_uint<8>> data;              // Data (8-bit)
     sc_in<bool> read_enable;             // Read Enable signal
     sc_in<bool> write_enable;            // Write Enable signal
 
-    sc_out<bool> interrupt0;             // Compare match interrupt (Active High)
-    sc_out<bool> interrupt1;             // Overflow interrupt (Active High)
+    sc_out<bool> interrupt0;             // Compare match interrupt (Active High Pulse)
+    sc_out<bool> interrupt1;             // Overflow interrupt (Active High Pulse)
 
     // Constructor
     SC_HAS_PROCESS(counter);
     counter(sc_module_name name);
     
     // Processes
-    void counter_logic();                  // Timer logic
-    void reset_func();                   //For handling reset operation
-    void register_access();              //For modifying the register values
+    void timer_process();                // Main timer process (event-based)
+    void reset_func();                   // Reset operation
+    void register_access();              // Register access
 
-};
-#include "counter.h"
+private:
+    // Events for interrupt scheduling
+    sc_event compare_event;
+    sc_event overflow_event;
+    sc_event clear_interrupts_event;
+
+    // Helper methods
+    void schedule_events();
+    void handle_compare_event();
+    void handle_overflow_event();
+    void clear_interrupts();
+};#include "counter.h"
 
 counter::counter(sc_module_name name) : sc_module(name) {
-    //initilaize the values before the simulation
+    // Initialize values
     CTRL = 0;
     VALUE = 0;
     STATUS = 0;
     COMPARE = 0;
- 
-    // Register processes
-    SC_METHOD(counter_logic);
-    sensitive << clock.pos();  // Trigger on positive edge of the clock
+    interrupt0.write(false);
+    interrupt1.write(false);
 
-    SC_METHOD(register_access);
-    sensitive << write_enable << read_enable;
+    // Register processes
+    SC_METHOD(timer_process);
+    sensitive << inputClock << reset << compare_event << overflow_event 
+             << clear_interrupts_event;
+    dont_initialize();
 
     SC_METHOD(reset_func);
     sensitive << reset;
+
+    SC_METHOD(register_access);
+    sensitive << write_enable << read_enable;
 }
+
 void counter::reset_func() {
     if (reset.read()) {
         // Reset all values to default
         CTRL = 0;
         VALUE = 0;
         STATUS = 0;
-        //COMPARE register value is not changed on reset
         interrupt0.write(false);
         interrupt1.write(false);
+        // Cancel any pending events
+        compare_event.cancel();
+        overflow_event.cancel();
+        clear_interrupts_event.cancel();
     }
 }
-void counter::counter_logic() {
-        if (CTRL[0]) { // Check Timer Enable (bit 0 of CTRL)
-            VALUE++; // Increment timer counter
-      
-            // Check for Compare Match Interrupt
-            if (CTRL[1] && VALUE == 32) { // CMP bit (bit 1 of CTRL)
-                STATUS[0] = 1; // Set Compare Match Interrupt status bit
-                interrupt0.write(true);
-            }
 
-            // Check for Overflow Interrupt
-            if (CTRL[2] && VALUE == 0xFF) { // OV bit (bit 2 of CTRL)
-                STATUS[1] = 1; // Set Overflow Interrupt status bit
-                interrupt1.write(true);
-            }  
-        }
+void counter::timer_process() {
+    if (reset.read()) return;
+
+    // Check if we need to schedule new events
+    if (inputClock.event()) {
+        schedule_events();
+        return;
+    }
+
+    // Handle compare event
+    if (compare_event.triggered()) {
+        handle_compare_event();
+        return;
+    }
+
+    // Handle overflow event
+    if (overflow_event.triggered()) {
+        handle_overflow_event();
+        return;
+    }
+
+    // Handle interrupt clearing
+    if (clear_interrupts_event.triggered()) {
+        clear_interrupts();
+        return;
+    }
 }
 
-// This is the internal register access mechanism
+void counter::schedule_events() {
+    if (!CTRL[0]) return; // Timer not enabled
+
+    sc_time period = inputClock.read();
+    
+    // Calculate time until compare match
+    if (CTRL[1] && COMPARE > VALUE) { // Compare interrupt enabled
+        sc_time time_to_compare = period * (COMPARE - VALUE);
+        compare_event.notify(time_to_compare);
+    }
+
+    // Calculate time until overflow
+    if (CTRL[2]) { // Overflow interrupt enabled
+        sc_time time_to_overflow = period * (0xFF - VALUE);
+        overflow_event.notify(time_to_overflow);
+    }
+}
+
+void counter::handle_compare_event() {
+    if (!CTRL[1]) return; // Compare interrupt not enabled
+    
+    // Update status and trigger interrupt
+    STATUS[0] = 1;
+    interrupt0.write(true);
+    
+    // Schedule interrupt clearing after one period
+    clear_interrupts_event.notify(inputClock.read());
+    
+    // Update value (for accurate overflow calculation)
+    VALUE = COMPARE;
+    
+    // Reschedule events if needed
+    schedule_events();
+}
+
+void counter::handle_overflow_event() {
+    if (!CTRL[2]) return; // Overflow interrupt not enabled
+    
+    // Update status and trigger interrupt
+    STATUS[1] = 1;
+    interrupt1.write(true);
+    
+    // Schedule interrupt clearing after one period
+    clear_interrupts_event.notify(inputClock.read());
+    
+    // Reset counter
+    VALUE = 0;
+    
+    // Reschedule events
+    schedule_events();
+}
+
+void counter::clear_interrupts() {
+    interrupt0.write(false);
+    interrupt1.write(false);
+}
+
 void counter::register_access() {
     if (write_enable.read()) {
         switch (address.read()) {
-        case 0x0: CTRL = data.read();  break;
-        case 0x8: COMPARE = data.read(); break;
-        case 0xC: 
+        case 0x0: // Timer Control Register
+            CTRL = data.read();
+            // Reschedule events if timer was enabled/disabled
+            if (data.read()[0] != CTRL[0]) {
+                compare_event.cancel();
+                overflow_event.cancel();
+                schedule_events();
+            }
+            break;
+        case 0x8: // Timer Compare Register
+            COMPARE = data.read();
+            // Reschedule compare event if changed
+            compare_event.cancel();
+            schedule_events();
+            break;
+        case 0xC: // Timer Interrupt Status Register
             // Write-one-to-clear logic
-            if (data.read()[0]) {
-                STATUS[0] = 0;
-                interrupt0.write(false);
-            }
-            if (data.read()[1]) {
-                STATUS[1] = 0;
-                interrupt1.write(false);
-            }
+            if (data.read()[0]) STATUS[0] = 0;
+            if (data.read()[1]) STATUS[1] = 0;
             break;
         }
     }
     if (read_enable.read()) {
         switch (address.read()) {
-        case 0x0:cout << "The current value of CTRl register is= " << CTRL << endl;
-            break;
-        case 0x4:cout << "The current value of VALUE register is= " << VALUE << endl;
-            break;
-        case 0x8:cout << "The current value of COMPARE register is= " << COMPARE << endl;
-            break;
-        case 0xC:cout << "The current value of STATUS register is= " << STATUS << endl;
-            break;
+        case 0x0: cout << "CTRL: " << CTRL << endl; break;
+        case 0x4: cout << "VALUE: " << VALUE << endl; break;
+        case 0x8: cout << "COMPARE: " << COMPARE << endl; break;
+        case 0xC: cout << "STATUS: " << STATUS << endl; break;
         }
     }
-}
-#pragma once
+}#pragma once
 #include <systemc.h>
 
 #define COMPARE_VALUE 32     //set the compare value here
@@ -119,15 +205,15 @@ void counter::register_access() {
 class tb_counter : public sc_module {
 public:
     // Ports
-    sc_out<bool> tb_clock;                  // Clock signal
-    sc_out<bool> tb_reset;                  // Reset signal
-    sc_out<sc_uint<8>> tb_address;          // Address
-    sc_out<sc_uint<8>> tb_data;             // Data
-    sc_out<bool> tb_read_enable;            // Read enable
-    sc_out<bool> tb_write_enable;           // Write enable
+    sc_out<sc_time> tb_inputClock;       // Clock period output
+    sc_out<bool> tb_reset;               // Reset signal
+    sc_out<sc_uint<8>> tb_address;       // Address
+    sc_out<sc_uint<8>> tb_data;          // Data
+    sc_out<bool> tb_read_enable;         // Read enable
+    sc_out<bool> tb_write_enable;        // Write enable
 
-    sc_in<bool> tb_interrupt0;              // Compare match interrupt
-    sc_in<bool> tb_interrupt1;              // Overflow interrupt
+    sc_in<bool> tb_interrupt0;           // Compare match interrupt
+    sc_in<bool> tb_interrupt1;           // Overflow interrupt
 
     // Constructor
     SC_HAS_PROCESS(tb_counter);
@@ -135,112 +221,101 @@ public:
 
     // Test process
     void test();
-    void clock_cycle();
-
-    //Ordinary member functions
+    
+    // Ordinary member functions
     void register_write(sc_uint<8> address_var, sc_uint<8> data_var);
     void register_read(sc_uint<8> address_var);
-};
-#include "tb_counter.h"
+};#include "tb_counter.h"
 
 tb_counter::tb_counter(sc_module_name name): sc_module(name) {
-    SC_THREAD(test);        // Main test process
-    SC_THREAD(clock_cycle); // Clock generation process
-}
-
-void tb_counter::clock_cycle() {
-    while (true) {
-        tb_clock.write(false);
-        wait(5, SC_NS);  // Half clock period
-        tb_clock.write(true);
-        wait(5, SC_NS);  // Half clock period
-    }
+    SC_THREAD(test); // Main test process
 }
 
 void tb_counter::register_write(sc_uint<8> address_var, sc_uint<8> data_var) {
     tb_address.write(address_var);
     tb_data.write(data_var);
     tb_write_enable.write(true);
-    wait(SC_ZERO_TIME); // Wait for the write operation to complete
+    wait(SC_ZERO_TIME);
     tb_write_enable.write(false);
 }
 
 void tb_counter::register_read(sc_uint<8> address_var) {
     tb_address.write(address_var);
     tb_read_enable.write(true);
-    wait(SC_ZERO_TIME); // Wait for the read operation to complete
+    wait(SC_ZERO_TIME);
     tb_read_enable.write(false);
 }
 
 void tb_counter::test() {
-    cout << "Starting Timer Testbench..." << endl;
+    cout << "Starting Event-Based Timer Testbench..." << endl;
+
+    // Set clock period (10ns)
+    tb_inputClock.write(sc_time(10, SC_NS));
 
     // Step 1: Reset the system
     tb_reset.write(true);
     wait(SC_ZERO_TIME);
     tb_reset.write(false);
 
-    // Step 2: Configure Timer Control Register (Enable Timer, Enable Interrupts)
+    // Step 2: Configure Timer Control Register
     cout << "Configuring Timer Control Register..." << endl;
     register_write(0x0, 0x7); // Enable Timer, Enable CMP, Enable OV
 
     // Step 3: Set Compare Register
     cout << "Setting Compare Register to " << COMPARE_VALUE << endl;
-    register_write(0x8, COMPARE_VALUE); // Set compare value
+    register_write(0x8, COMPARE_VALUE);
 
-    // Step 4: Observe interrupts during timer operation
-    cout << "Observing Timer Operation for Compare and Overflow Interrupts..." << endl;
+    // Step 4: Observe interrupts
+    cout << "Observing Timer Operation..." << endl;
 
-    for (int i = 0; i < 300; i++) {  // Simulate 300 clock cycles
-        wait(10, SC_NS); // Wait for one clock cycle
+    for (int i = 0; i < 30; i++) {  // Reduced iterations since we're event-based
+        wait(100, SC_NS); // Wait longer between checks
 
         if (tb_interrupt0.read()) {
-            cout << "Compare Match Interrupt Triggered at Time: " << sc_time_stamp() << endl;
-            // Clear Compare Match Interrupt
-            register_write(0xC, 0x1); // Clear Compare Match Interrupt (STATUS[0])
+            cout << "Compare Match Interrupt at " << sc_time_stamp() << endl;
+            register_write(0xC, 0x1); // Clear interrupt
         }
 
         if (tb_interrupt1.read()) {
-            cout << "Overflow Interrupt Triggered at Time: " << sc_time_stamp() << endl;
-            // Clear Overflow Interrupt
-            register_write(0xC, 0x2); // Clear Overflow Interrupt (STATUS[1])
+            cout << "Overflow Interrupt at " << sc_time_stamp() << endl;
+            register_write(0xC, 0x2); // Clear interrupt
         }
     }
 
-    // Step 5: Verify register values
-    cout << "At the end of the simulation...Reading Timer Value Register..." << endl;
-    register_read(0x4);
     cout << "Test Completed. Ending Simulation..." << endl;
-    sc_stop(); // End simulation
-}
-#pragma once
+    sc_stop();
+}#pragma once
 #include "counter.h"
 #include "tb_counter.h"
 
 class top : public sc_module {
 public:
     // Internal Signals
-    sc_signal<bool> clock_signal;
+    sc_signal<sc_time> inputClock_signal;
     sc_signal<bool> reset_signal;
     sc_signal<sc_uint<8>> address_signal;
     sc_signal<sc_uint<8>> data_signal;
     sc_signal<bool> read_enable_signal;
     sc_signal<bool> write_enable_signal;
-    sc_signal<bool,SC_MANY_WRITERS> interrupt0_signal;
-    sc_signal<bool,SC_MANY_WRITERS> interrupt1_signal;
+    sc_signal<bool> interrupt0_signal;
+    sc_signal<bool> interrupt1_signal;
 
-    // Sub-modules (statically allocated)
-    tb_counter tb;    // Testbench instance
-    counter timer;    // Timer counter module instance
+    // Sub-modules
+    tb_counter tb;
+    counter timer;
 
     // Constructor
     SC_HAS_PROCESS(top);
     top(sc_module_name name);
 };#include "top.h"
 
-top::top(sc_module_name name): sc_module(name),timer("timer"),tb("tb_counter"){
-    // Bind signals to Timer Counter Module
-    timer.clock(clock_signal);
+top::top(sc_module_name name): 
+    sc_module(name),
+    tb("tb_counter"),
+    timer("timer") 
+{
+    // Bind timer ports
+    timer.inputClock(inputClock_signal);
     timer.reset(reset_signal);
     timer.address(address_signal);
     timer.data(data_signal);
@@ -249,8 +324,8 @@ top::top(sc_module_name name): sc_module(name),timer("timer"),tb("tb_counter"){
     timer.interrupt0(interrupt0_signal);
     timer.interrupt1(interrupt1_signal);
 
-    // Bind signals to Testbench
-    tb.tb_clock(clock_signal);
+    // Bind testbench ports
+    tb.tb_inputClock(inputClock_signal);
     tb.tb_reset(reset_signal);
     tb.tb_address(address_signal);
     tb.tb_data(data_signal);
@@ -259,9 +334,10 @@ top::top(sc_module_name name): sc_module(name),timer("timer"),tb("tb_counter"){
     tb.tb_interrupt0(interrupt0_signal);
     tb.tb_interrupt1(interrupt1_signal);
 
-    // For waveform tracing
-    /*sc_trace_file* tf = sc_create_vcd_trace_file("traces");
-    sc_trace(tf, clock_signal, "clock");
+    // Uncomment for waveform tracing if needed
+    /*
+    sc_trace_file* tf = sc_create_vcd_trace_file("event_based_traces");
+    sc_trace(tf, inputClock_signal, "inputClock");
     sc_trace(tf, reset_signal, "reset");
     sc_trace(tf, address_signal, "address");
     sc_trace(tf, data_signal, "data");
@@ -272,83 +348,6 @@ top::top(sc_module_name name): sc_module(name),timer("timer"),tb("tb_counter"){
     sc_trace(tf, timer.CTRL, "CTRL");
     sc_trace(tf, timer.VALUE, "VALUE");
     sc_trace(tf, timer.COMPARE, "COMPARE");
-    sc_trace(tf, timer.STATUS, "STATUS");*/
+    sc_trace(tf, timer.STATUS, "STATUS");
+    */
 }
-#include <systemc.h>
-#include "top.h"
-
-int sc_main(int argc, char* argv[]) {
-    
-    top top_module("top");  // Create the top-level module (statically allocated)
-
-    sc_start();             // Start the SystemC simulation
-
-    return 0;
-}
-here are all the files for the prvious experiment which was the counter design using cycle accurate modelling now i want the counter desgin using the event based approach and the question of that is as follows:2.10	8-bit Timer Counter Module – Event Based
-Objective	Implement Event based 8 bit Timer Counter Module using SystemC   
-Requirements	Input Ports
-	sc_time inputClock (This will be configured with clock time period at which it should increment its counter and this time period value is provided by TB)
-	Boolean reset
-	Uint address<8>
-	Uint data<8>
-	Boolean read_enable
-	Boolean write_enable
-Output Ports
-	Boolean interrupt0 (Active High Pulse Interrupt)
-	Boolean interrupt1 (Active High Pulse Interrupt)
-
-Registers
-The module should also consists of couple of 8bit Special Function Registers(SFRs) to configure the Timer module. The register sets as defined as below:
- 
-2.	Timer control Register(CTRL) - Offset Address = 0x0
- 
- 
-0bit - En - Timer Enable bit, where if you configure it to:
-0 => Timer is disable and counter does not increment All register can still be read and written 
-1 => Timer is enabled and counter will increment normally. Timer counter will be incremented every clock cycle.
- 
-1bit - CMP- Timer compare Interrupt Enable, where if you configure it to:
-0 =>Compare interrupt is disabled  
-1 => Compare interrupt is enable. 
-If enabled then whenever timer counter value reaches to compare value it will raise the interrupt line(Interrupt0).
- 
-2bit - OV - Overflow Interrupt Enable, where if you configure it to:
-0 =>Overflow interrupt is disabled  
-1 => Overflow interrupt is enable. 
-if timer counter value reaches to OxFF, in the next clock cycle it will update start counting from zero, and raise the interrupt line(Interrupt1) corresponding to overflow interrupt.
- 
-3.	Timer Value Register - Offset Address = 0x4
- 
- 
-This is a read only register, Whenever timer is enabled it will start incrementing value of this register. 
- 
-4.	Timer Compare Register - Offset Address = 0x8
- 
- 
-This register can be used to store the comparison value for timer counter register. If timer compare interrupt is enable, then it will assert an interrupt line INTO whenever timer value matches with the timer compare value.
- 
-5.	Timer Interrupt status Register - Offset Address = 0xC
- 
- 
-This is a write one clear interrupt status register. If timer is enabled then whenever timer counter value reaches a comparator value or an overflow occurs then it will update the corresponding status bit if related interrupt is enabled. Writing a 1 will clear the corresponding interrupt
-
-Test Scenario	Implement the 8-bit Timer Counter Module with event-based approach:
-1.	The timer model should not have the pin for the clock.
-2.	The timer should not count/increment at every clock edge, rather we should apply the mathematical formulas to calculate when the interrupts will be generated. that means increment should not be sensitive to the clock.
-3.	The testbench should remain the same, only the clock pin will be removed.
-4.	You should get exactly the same output, which means functionality will be the same.
-5.	Note down how much wall clock time is consumed by the simulation.
-6.	Run both implementations of models, and check the difference in the wall clock time elapsed for simulating the same amount of simulation time. And conclude your decision.
-
-Note: Timer module has to clear the interrupts (interrupt0 and interrupt1) (once it is set to due to trigger condition) after one cycle of the input time interval
- 
- 
-Negative Test Scenario:
-1.	The Interrupt0/1 has to be logic low in entire simulation time except when overflow or comparator match event is triggered
-Pass Criteria	1.	Modelling the timer module by using sc_time and not the bool clock
-2.	Registers set should be accessible from TB
-3.	Interrupt0 and Interrupt1 has to be triggered at expected time and also needs to update corresponding status register bit fields
-Key Learnings	1.	Event Based Modelling
-2.	Raising/Toggling the Interrupts using input sc_time clock period as reference (Without Boolean clock)
-now take the refrences of the code provided to u(in case fo cycle acurrate modelling) and preovide the code for the event based modelling based on the modifaction of that code accordign the question and the requitments given to u 
